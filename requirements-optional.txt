@@ -1,0 +1,5 @@
+# Optional dependencies
+spacy
+
+# To download French small model after installing spaCy:
+# python -m spacy download fr_core_news_sm

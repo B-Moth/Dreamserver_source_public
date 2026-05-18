@@ -1,0 +1,63 @@
+server:
+  host: 0.0.0.0
+  port: 8765
+  api_key: "dream"
+
+pwa:
+  base_path: "/app"
+
+whisper:
+  model: large-v3
+  language: fr
+  device: cpu
+  compute_type: int8
+
+ollama:
+  model: mistral
+  host: http://127.0.0.1:11434
+
+digest:
+  request_timeout_seconds: 0
+  num_predict: 700
+  temperature: 0.28
+  retry_timeout_seconds: 0
+  retry_num_predict: 220
+  retry_temperature: 0.22
+  max_pending_seconds: 0
+  ollama_failure_threshold: 3
+  ollama_cooldown_seconds: 900
+  summary_retention_days: 45
+
+maintenance:
+  enabled: true
+  offhours_start: 2
+  offhours_end: 6
+  interval_minutes: 120
+
+interpretation:
+  request_timeout_seconds: 0
+  max_pending_seconds: 0
+  num_predict: 360
+  temperature: 0.6
+  fallback_timeout_seconds: 0
+  fallback_max_chars: 1400
+  fallback_num_predict: 180
+  fallback_temperature: 0.5
+  max_source_overlap_ratio: 0.66
+  allow_local_fallback: false
+
+storage:
+  entries_dir: /home/sandman/dreamserver/storage/entries
+
+vocabulary_file: /home/sandman/dreamserver/vocabulary.txt
+
+push:
+  vapid_public_key: "BBSnDFGD_3HIUTTTS_5pw-qg_Dp1XMqNLqE0UkDjRo0hebk0i_WQSwC2bZBwwCR5B8tLr4dganmCnfZNr3cM5Vo="
+  vapid_private_key: "/home/sandman/dreamserver/vapid_private.pem"
+  vapid_email: "lucaspvberne@gmail.com"
+
+remote_access:
+  enabled: false
+
+correction:
+  enabled: false

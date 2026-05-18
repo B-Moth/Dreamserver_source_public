@@ -1,0 +1,6 @@
+black
+ruff
+isort
+pre-commit
+pytest
+spacy
