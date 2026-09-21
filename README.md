@@ -1,8 +1,9 @@
-# Dreamserver
+# Dreamserver (WIP)
 
 Personal dream-journal: a FastAPI backend (`Dreamserver`) plus a React PWA to record, transcribe, correct, and semantically organize dream entries. Extracts keywords (Dream Map) and runs LLM interpretations for fun.
-
 This project is designed to function in tandem with DreamCatcher, an alarm clock controlled by a micro-computer capable of recording audio on demand, transmit it to the server to give the user a fully automated dream journal.
+You can find the repo for DreamCatcher (the physical part of the project) here : https://github.com/B-Moth/Dreamcatcher
+
 
 Frontend (PWA)
 ----------------
