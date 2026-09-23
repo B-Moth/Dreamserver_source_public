@@ -35,6 +35,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
+app.include_router(settings_router)
 
 _digest_lock = threading.Lock()
 _digest_summary_queue = {}
@@ -49,7 +50,6 @@ _fallback_retry_lock = threading.Lock()
 _fallback_retry_queue = []
 _fallback_retry_pending = set()
 
-from api.utils import token_findall, term_findall, word_token_findall
 from api.interpretation import (
     build_interpreter_prompt, interpreter_prompt_signature,
     compact_interpret_prompt, anti_paraphrase_prompt,
@@ -65,8 +65,6 @@ from api.config import (
 )
 from api.profile import (
     load_user_profile as _load_user_profile,
-    sanitize_user_profile as _sanitize_user_profile,
-    save_user_profile as _save_user_profile,
     user_addressing_instruction as _user_addressing_instruction,
     user_profile_for_prompt as _user_profile_for_prompt,
     user_profile_signature as _user_profile_signature,
@@ -85,17 +83,20 @@ from api.analytics import (
 )
 from api.semantic_store import SemanticStore
 from api.interpretation_store import InterpretationStore
+from api.interpretation_service import InterpretationService
+from api.routes.settings import router as settings_router
+from api.dream_map_rules import (
+    collect_tags as _dream_map_collect_tags,
+    is_content_word as _dream_map_is_content_word,
+    is_keyword as _dream_map_is_keyword,
+    normalize_tag as _normalize_tag,
+)
 
 _semantic_store = SemanticStore(SEMANTIC_GROUPS_FILE, log)
 
 
-def _normalize_tag(tag: str) -> str:
-    return str(tag or "").strip().lower()
 
 
-_DREAM_MAP_PRONOUNS = set(
-    "je j tu il elle on nous vous ils elles me m te t se s le la les lui leur eux en y ce cet cette ces cela ça ca celui celle ceux celles mien tien sien notre votre leur mon ton son ma ta sa mes tes ses leurs moi toi soi their them they he she we you i".split()
-)
 
 
 def _digest_summary_path(days: int, weeks_ago: int) -> Path:
@@ -390,370 +391,20 @@ def _apply_dream_date_fallback(meta: dict):
     return meta
 
 
-_DREAM_MAP_PREPOSITIONS = {
-    "a",
-    "à",
-    "de",
-    "du",
-    "des",
-    "d",
-    "l",
-    "au",
-    "aux",
-    "par",
-    "pour",
-    "sur",
-    "sous",
-    "dans",
-    "avec",
-    "sans",
-    "entre",
-    "vers",
-    "chez",
-    "apres",
-    "après",
-    "avant",
-    "pendant",
-    "selon",
-    "contre",
-    "durant",
-    "parmi",
-    "sur",
-    "sous",
-    "chez",
-    "depuis",
-    "jusque",
-    "jusqu",
-    "hors",
-    "via",
-    "sur",
-}
-
-_DREAM_MAP_INTERJECTIONS = {
-    "ah",
-    "oh",
-    "eh",
-    "hein",
-    "hélas",
-    "helas",
-    "ouf",
-    "ouf",
-    "aie",
-    "oups",
-    "bah",
-    "bof",
-    "hum",
-    "bravo",
-    "zut",
-    "holà",
-    "hola",
-    "yo",
-    "hey",
-}
-
-_DREAM_MAP_ADVERBS = {
-    "très",
-    "tres",
-    "si",
-    "bien",
-    "mal",
-    "plus",
-    "moins",
-    "encore",
-    "deja",
-    "déjà",
-    "jamais",
-    "toujours",
-    "souvent",
-    "rarement",
-    "vite",
-    "lentement",
-    "vite",
-    "ici",
-    "là",
-    "la",
-    "ailleurs",
-    "presque",
-    "assez",
-    "tellement",
-    "seulement",
-    "vraiment",
-    "beaucoup",
-    "peu",
-    "trop",
-    "non",
-    "oui",
-    "peut-être",
-    "peut",
-    "peutetre",
-    "probablement",
-    "peut_etre",
-    "simplement",
-    "finalement",
-    "ensuite",
-}
-
-_DREAM_MAP_COMMON_VERBS = {
-    "etre",
-    "être",
-    "avoir",
-    "faire",
-    "aller",
-    "venir",
-    "voir",
-    "savoir",
-    "pouvoir",
-    "vouloir",
-    "falloir",
-    "dire",
-    "mettre",
-    "prendre",
-    "donner",
-    "venir",
-    "partir",
-    "laisser",
-    "arriver",
-    "passer",
-    "devoir",
-    "penser",
-    "sembler",
-    "rester",
-    "sentir",
-    "rêver",
-    "reve",
-    "regarder",
-    "parler",
-    "aimer",
-    "dormir",
-    "marcher",
-    "courir",
-    "ouvrir",
-    "fermer",
-    "trouver",
-    "montrer",
-    "tourner",
-    "tomber",
-    "savoir",
-    "peux",
-    "peut",
-    "peut",
-    "vais",
-    "va",
-    "vont",
-    "viens",
-    "vient",
-    "fais",
-    "fait",
-    "font",
-    "dis",
-    "dit",
-    "suis",
-    "es",
-    "est",
-    "sommes",
-    "êtes",
-    "etes",
-    "sont",
-    "avais",
-    "avait",
-    "avaient",
-    "allais",
-    "allait",
-    "allons",
-    "allez",
-    "allaient",
-    "faisais",
-    "faisait",
-    "faisaient",
-    "prends",
-    "prend",
-    "prennent",
-}
-
-_DREAM_MAP_ALLOWED_SUFFIXES = (
-    "tion",
-    "sion",
-    "aison",
-    "ure",
-    "ité",
-    "ite",
-    "esse",
-    "ance",
-    "ence",
-    "isme",
-    "iste",
-    "eur",
-    "euse",
-    "eux",
-    "ique",
-    "able",
-    "ible",
-    "if",
-    "ive",
-    "al",
-    "ale",
-    "el",
-    "elle",
-    "ain",
-    "aine",
-    "ien",
-    "ienne",
-    "ois",
-    "oise",
-    "ard",
-    "arde",
-    "ot",
-    "ote",
-    "in",
-    "ine",
-    "âtre",
-    "ette",
-    "erie",
-    "erie",
-    "erie",
-)
-
-_DREAM_MAP_VERB_SUFFIXES = (
-    "er",
-    "ers",
-    "ez",
-    "ais",
-    "ait",
-    "aient",
-    "ons",
-    "ont",
-    "ant",
-    "issant",
-    "ir",
-    "is",
-    "it",
-    "issent",
-    "irais",
-    "irait",
-    "ira",
-    "iront",
-    "iraient",
-    "re",
-    "oir",
-    "ue",
-    "ées",
-    "ée",
-    "és",
-    "ent",
-)
-
-_DREAM_MAP_EXCLUDED_WORDS = set().union(
-    _DREAM_MAP_PREPOSITIONS,
-    _DREAM_MAP_INTERJECTIONS,
-    _DREAM_MAP_ADVERBS,
-    _DREAM_MAP_COMMON_VERBS,
-    {
-        "le",
-        "la",
-        "les",
-        "un",
-        "une",
-        "des",
-        "du",
-        "de",
-        "d",
-        "l",
-        "et",
-        "ou",
-        "mais",
-        "donc",
-        "or",
-        "ni",
-        "car",
-        "que",
-        "qui",
-        "quoi",
-        "dont",
-        "où",
-        "ou",
-        "ce",
-        "c",
-        "cet",
-        "cette",
-        "ces",
-        "mon",
-        "ton",
-        "son",
-        "mes",
-        "tes",
-        "ses",
-        "nos",
-        "vos",
-        "leurs",
-        "leur",
-        "au",
-        "aux",
-        "pas",
-        "ne",
-        "rien",
-        "personne",
-        "tout",
-        "tous",
-        "toute",
-        "toutes",
-        "chaque",
-        "aucun",
-        "aucune",
-        "plus",
-        "moins",
-    },
-)
 
 
-def _dream_map_split_terms(value: str) -> list[str]:
-    return [term.strip("-_'’") for term in term_findall(value) if term.strip("-_'’")]
 
 
-def _dream_map_is_content_word(term: str) -> bool:
-    word = _normalize_tag(term)
-    if not word or len(word) < 3:
-        return False
-    if any(ch.isdigit() for ch in word):
-        return False
-    if word in _DREAM_MAP_EXCLUDED_WORDS:
-        return False
-    if any(word.endswith(suffix) for suffix in _DREAM_MAP_VERB_SUFFIXES):
-        return False
-    return (
-        any(word.endswith(suffix) for suffix in _DREAM_MAP_ALLOWED_SUFFIXES)
-        or len(word) >= 3
-    )
 
 
-def _dream_map_is_keyword(value: str) -> bool:
-    terms = _dream_map_split_terms(value)
-    if not terms:
-        return False
-    return any(_dream_map_is_content_word(term) for term in terms)
 
 
-def _dream_map_collect_tags(entries_dir: Path) -> list[str]:
-    tags = set()
-    for entry in entries_dir.iterdir():
-        if not entry.is_dir():
-            continue
 
-        meta_file = entry / "meta.json"
-        if not meta_file.exists():
-            continue
 
-        try:
-            with open(meta_file) as f:
-                meta = json.load(f)
-        except Exception:
-            continue
 
-        for tag in meta.get("tags", []) or []:
-            normalized = _normalize_tag(tag)
-            if normalized and _dream_map_is_keyword(normalized):
-                tags.add(normalized)
 
-    return sorted(tags)
+
+
 
 
 def _ensure_semantic_store_loaded():
@@ -1187,26 +838,18 @@ _interpretation_store = InterpretationStore()
 _interpretation_queue = _interpretation_store.queue
 _interpretation_errors = _interpretation_store.errors
 _interpretation_job_tokens = _interpretation_store.tokens
+_interpretation_service = InterpretationService(
+    store=_interpretation_store,
+    run_job_fn=run_interpretation_job,
+    load_config_fn=_load_config,
+    write_interpretation_fn=_write_interpretation,
+    normalize_timeout_fn=_normalize_timeout_seconds,
+    logger=log,
+)
 
 
 def _cleanup_stale_interpretations():
-    """Expire stuck interpretation jobs and surface a clear error state."""
-    config = _load_config()
-    interp_cfg = config.get("interpretation", {})
-    max_pending = int(interp_cfg.get("max_pending_seconds", 180))
-    if max_pending <= 0:
-        return
-    now = time.time()
-
-    stale_jobs = [
-        key
-        for key, started_at in _interpretation_queue.items()
-        if (now - started_at) > max_pending
-    ]
-    for key in stale_jobs:
-        _interpretation_queue.pop(key, None)
-        _interpretation_errors[key] = f"Timed out after {max_pending}s"
-        log.error(f"Interpretation job expired: {key} (>{max_pending}s)")
+    _interpretation_service.cleanup_stale()
 
 
 def _is_digest_job_current(job_key: str, token: int) -> bool:
@@ -1214,7 +857,7 @@ def _is_digest_job_current(job_key: str, token: int) -> bool:
 
 
 def _is_interpretation_job_current(job_key: str, token: int) -> bool:
-    return int(_interpretation_job_tokens.get(job_key, 0)) == int(token)
+    return _interpretation_service.is_current(job_key, token)
 
 
 def _compact_interpret_prompt(interpreter_name: str, text: str) -> str:
@@ -1298,7 +941,6 @@ async def interpret_entry(
         _interpretation_queue.pop(job_key, None)
         _interpretation_errors.pop(job_key, None)
 
-    worker_token = int(_interpretation_job_tokens.get(job_key, 0))
     if force and interp_file.exists():
         try:
             interp_file.unlink()
@@ -1369,43 +1011,14 @@ async def interpret_entry(
     if not text:
         raise HTTPException(status_code=400, detail="No transcript available")
 
-    # Launch in background thread
-    _interpretation_queue[job_key] = time.time()
-    _interpretation_errors.pop(job_key, None)
-
-    def run_interpretation():
-        # Delegate the heavy lifting to the interpretation module's job runner.
-        try:
-            success, error = run_interpretation_job(
-                entry_dir=entry_dir,
-                timestamp=timestamp,
-                interpreter_key=interpreter_key,
-                text=text,
-                job_key=job_key,
-                worker_token=worker_token,
-                current_prompt_signature=current_prompt_signature,
-                load_config_fn=_load_config,
-                is_job_current_fn=_is_interpretation_job_current,
-                write_interpretation_fn=_write_interpretation,
-                normalize_timeout_fn=_normalize_timeout_seconds,
-            )
-            if success:
-                _interpretation_errors.pop(job_key, None)
-                log.info(
-                    f"Interpretation ({interpreter_key}) done: {timestamp} via job runner"
-                )
-            else:
-                if error and _is_interpretation_job_current(job_key, worker_token):
-                    _interpretation_errors[job_key] = error
-        except Exception as e:
-            if _is_interpretation_job_current(job_key, worker_token):
-                _interpretation_errors[job_key] = str(e)
-            log.error(f"Interpretation failed: {e}")
-        finally:
-            if _is_interpretation_job_current(job_key, worker_token):
-                _interpretation_queue.pop(job_key, None)
-
-    threading.Thread(target=run_interpretation, daemon=True).start()
+    _interpretation_service.start(
+        entry_dir=entry_dir,
+        timestamp=timestamp,
+        interpreter_key=interpreter_key,
+        text=text,
+        job_key=job_key,
+        prompt_signature=current_prompt_signature,
+    )
     return JSONResponse({"status": "pending", "forced": bool(force)})
 
 
@@ -1752,283 +1365,6 @@ def _compute_weekly_digest_payload(days: int = 7, weeks_ago: int = 0):
     return _compute_weekly_digest(entries_dir, days, weeks_ago)
 
 
-def _legacy_compute_weekly_digest_payload(days: int = 7, weeks_ago: int = 0):
-    config = _load_config()
-    entries_dir = Path(config["storage"]["entries_dir"])
-
-    if not entries_dir.exists():
-        return {"days": days, "entries": []}
-
-    from datetime import timedelta
-    import calendar
-    from collections import Counter
-
-    days = 7
-    weeks_ago = max(0, min(int(weeks_ago or 0), 26))
-    now = datetime.now()
-    today = now.date()
-
-    # Fixed weekly window: Monday -> Sunday.
-    current_monday = today - timedelta(days=today.weekday())
-    week_start_date = current_monday - timedelta(days=weeks_ago * 7)
-    week_end_date = week_start_date + timedelta(days=6)
-    week_complete = week_end_date < today
-
-    # window_start/window_end intentionally unused; remove to satisfy linters.
-
-    stopwords = {
-        "je",
-        "tu",
-        "il",
-        "elle",
-        "nous",
-        "vous",
-        "ils",
-        "elles",
-        "me",
-        "te",
-        "se",
-        "le",
-        "la",
-        "les",
-        "un",
-        "une",
-        "des",
-        "du",
-        "de",
-        "d",
-        "l",
-        "y",
-        "en",
-        "et",
-        "est",
-        "etait",
-        "etre",
-        "avoir",
-        "que",
-        "qui",
-        "quoi",
-        "dont",
-        "ou",
-        "mais",
-        "donc",
-        "or",
-        "ni",
-        "car",
-        "si",
-        "plus",
-        "tres",
-        "bien",
-        "tout",
-        "tous",
-        "cette",
-        "ce",
-        "cet",
-        "ces",
-        "mon",
-        "ton",
-        "son",
-        "ma",
-        "ta",
-        "sa",
-        "nos",
-        "vos",
-        "leurs",
-        "leur",
-        "au",
-        "aux",
-        "par",
-        "pour",
-        "sur",
-        "sous",
-        "dans",
-        "avec",
-        "sans",
-        "entre",
-        "vers",
-        "chez",
-        "apres",
-        "avant",
-        "pendant",
-        "alors",
-        "puis",
-        "aussi",
-        "meme",
-        "comme",
-        "quand",
-        "encore",
-        "deja",
-        "jamais",
-        "toujours",
-        "pas",
-        "ne",
-        "rien",
-        "personne",
-        "non",
-        "oui",
-        "suis",
-        "etais",
-        "étais",
-        "etaient",
-        "étaient",
-        "avais",
-        "avait",
-        "avions",
-        "aviez",
-        "ont",
-        "etre",
-    }
-
-    nightmare_terms = {
-        "cauchemar",
-        "peur",
-        "angoisse",
-        "panique",
-        "sombre",
-        "cri",
-        "poursuite",
-        "tomber",
-    }
-
-    def _safe_parse_dt(meta):
-        for key in ["dream_date", "received_at"]:
-            raw = meta.get(key)
-            if raw:
-                try:
-                    dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-                    if dt.tzinfo is not None:
-                        dt = dt.astimezone().replace(tzinfo=None)
-                    return dt
-                except Exception:
-                    pass
-        ts = meta.get("timestamp", "")
-        try:
-            return datetime.strptime(ts.split("_")[0], "%Y-%m-%d")
-        except Exception:
-            return None
-
-    entries = []
-    tag_counter = Counter()
-    word_counter = Counter()
-    nightmare_count = 0
-    daily_counter = Counter()
-
-    month_ref = datetime.combine(week_end_date, datetime.min.time())
-    cal_year = month_ref.year
-    cal_month = month_ref.month
-    month_start = datetime(cal_year, cal_month, 1)
-    month_days = calendar.monthrange(cal_year, cal_month)[1]
-    month_end = datetime(cal_year, cal_month, month_days, 23, 59, 59)
-    month_night_counter = Counter()
-
-    for entry in sorted(entries_dir.iterdir(), reverse=True):
-        if not entry.is_dir():
-            continue
-        meta_file = entry / "meta.json"
-        if not meta_file.exists():
-            continue
-
-        try:
-            with open(meta_file) as f:
-                meta = json.load(f)
-        except Exception:
-            continue
-
-        if not meta.get("transcribed"):
-            continue
-
-        dt = _safe_parse_dt(meta)
-        if not dt:
-            continue
-        day_only = dt.date()
-        if day_only < week_start_date or day_only > week_end_date:
-            continue
-
-        text = ""
-        for fname in [
-            "transcript_user.txt",
-            "transcript_corrected.txt",
-            "transcript_raw.txt",
-        ]:
-            f = entry / fname
-            if f.exists():
-                text = f.read_text().strip()
-                break
-
-        tags = [
-            str(t).strip().lower() for t in (meta.get("tags") or []) if str(t).strip()
-        ]
-        tag_counter.update(tags)
-
-        lowered = text.lower()
-        tokens = re.findall(r"[a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ'’\-]{3,}", lowered)
-        cleaned = []
-        for tok in tokens:
-            t = tok.strip("-'’")
-            if t.startswith(("d'", "l'", "j'", "qu'", "d’", "l’", "j’", "qu’")):
-                t = t.split("'", 1)[-1] if "'" in t else t.split("’", 1)[-1]
-            t = t.strip("-'’")
-            if len(t) >= 4 and t not in stopwords:
-                cleaned.append(t)
-        word_counter.update(cleaned)
-
-        is_nightmare = bool(nightmare_terms.intersection(set(tags))) or any(
-            term in lowered for term in nightmare_terms
-        )
-        if is_nightmare:
-            nightmare_count += 1
-
-        day_key = dt.strftime("%Y-%m-%d")
-        daily_counter[day_key] += 1
-
-        if month_start <= dt <= month_end:
-            month_night_counter[dt.day] += 1
-
-        entries.append(
-            {
-                "timestamp": meta.get("timestamp", entry.name),
-                "dream_date": meta.get("dream_date") or meta.get("received_at"),
-                "preview": (text[:170] + "…") if len(text) > 170 else text,
-                "tags": tags[:6],
-                "nightmare": is_nightmare,
-            }
-        )
-
-    total_entries = len(entries)
-    ratio = (nightmare_count / total_entries) if total_entries else 0.0
-    tension_level = "high" if ratio >= 0.45 else "medium" if ratio >= 0.2 else "low"
-
-    # Keep day buckets stable in order.
-    daily = []
-    for i in range(7):
-        d = (week_start_date + timedelta(days=i)).strftime("%Y-%m-%d")
-        daily.append({"date": d, "count": daily_counter.get(d, 0)})
-
-    return {
-        "days": 7,
-        "weeks_ago": weeks_ago,
-        "window_start": week_start_date.strftime("%Y-%m-%d"),
-        "window_end": week_end_date.strftime("%Y-%m-%d"),
-        "week_complete": week_complete,
-        "calendar": {
-            "year": cal_year,
-            "month": cal_month,
-            "first_weekday": month_start.weekday(),
-            "days_in_month": month_days,
-            "dream_nights": [
-                {"day": day, "count": count}
-                for day, count in sorted(month_night_counter.items())
-            ],
-        },
-        "total_entries": total_entries,
-        "nightmare_entries": nightmare_count,
-        "nightmare_ratio": round(ratio, 2),
-        "tension_level": tension_level,
-        "top_tags": tag_counter.most_common(10),
-        "top_words": word_counter.most_common(12),
-        "daily": daily,
-        "highlights": entries[:8],
-    }
 
 
 @app.post("/digest/weekly/summary")
@@ -2432,106 +1768,6 @@ def search_entries(q: str, x_api_key: str = Header(None)):
     return JSONResponse(
         _search_entries(entries_dir, q, normalize_meta=_apply_dream_date_fallback)
     )
-
-
-@app.get("/vocabulary")
-def get_vocabulary(x_api_key: str = Header(None)):
-    """Get the current vocabulary list."""
-    _verify_api_key(x_api_key)
-    config = _load_config()
-    vocab_file = Path(config.get("vocabulary_file", ""))
-    if not vocab_file.exists():
-        return JSONResponse({"vocabulary": ""})
-    return JSONResponse({"vocabulary": vocab_file.read_text()})
-
-
-@app.post("/vocabulary/update")
-async def update_vocabulary(request: Request, x_api_key: str = Header(None)):
-    """Replace the entire vocabulary list. Body: {\"vocabulary\": \"word1, word2, ...\"}"""
-    _verify_api_key(x_api_key)
-    config = _load_config()
-    vocab_file = Path(config.get("vocabulary_file", ""))
-    vocab_file.parent.mkdir(parents=True, exist_ok=True)
-
-    body = await request.json()
-    vocabulary = body.get("vocabulary", "")
-    vocab_file.write_text(vocabulary)
-
-    log.info(f"Vocabulary updated: {vocabulary[:50]}...")
-    return JSONResponse({"status": "ok"})
-
-
-@app.post("/vocabulary/add")
-async def add_vocabulary_word(request: Request, x_api_key: str = Header(None)):
-    """Add a single word to vocabulary. Body: {\"word\": \"...\"}"""
-    _verify_api_key(x_api_key)
-    config = _load_config()
-    vocab_file = Path(config.get("vocabulary_file", ""))
-    vocab_file.parent.mkdir(parents=True, exist_ok=True)
-
-    body = await request.json()
-    word = body.get("word", "").strip()
-    if not word:
-        raise HTTPException(status_code=400, detail="Word is required")
-
-    existing = vocab_file.read_text().strip() if vocab_file.exists() else ""
-    words = [w.strip() for w in existing.split(",") if w.strip()]
-
-    if word not in words:
-        words.append(word)
-        vocab_file.write_text(", ".join(words))
-        log.info(f"Vocabulary word added: {word}")
-        return JSONResponse({"status": "ok", "added": True})
-    else:
-        return JSONResponse(
-            {"status": "ok", "added": False, "message": "Already in vocabulary"}
-        )
-
-
-@app.get("/profile")
-def get_profile(x_api_key: str = Header(None)):
-    """Get editable user profile used as LLM context."""
-    _verify_api_key(x_api_key)
-    return JSONResponse(_load_user_profile())
-
-
-@app.post("/profile/update")
-async def update_profile(request: Request, x_api_key: str = Header(None)):
-    """Replace user profile used by digest/interpretation generation."""
-    _verify_api_key(x_api_key)
-    body = await request.json()
-    profile = _sanitize_user_profile(body if isinstance(body, dict) else {})
-    _save_user_profile(profile)
-    return JSONResponse({"status": "ok", "profile": profile})
-
-
-@app.post("/push/subscribe")
-async def push_subscribe(request: Request, x_api_key: str = Header(None)):
-    """Register a PWA push subscription."""
-    _verify_api_key(x_api_key)
-    body = await request.json()
-    add_subscription(body)
-    return JSONResponse({"status": "ok"})
-
-
-@app.delete("/push/subscribe")
-async def push_unsubscribe(request: Request, x_api_key: str = Header(None)):
-    """Unregister a push subscription. Body: {\"endpoint\": \"...\"}"""
-    _verify_api_key(x_api_key)
-    body = await request.json()
-    endpoint = body.get("endpoint")
-    if endpoint:
-        remove_subscription(endpoint)
-    return JSONResponse({"status": "ok"})
-
-
-@app.get("/push/key")
-def push_public_key(x_api_key: str = Header(None)):
-    """Return the VAPID public key for the PWA."""
-    _verify_api_key(x_api_key)
-    config = _load_config()
-    public_key = config.get("push", {}).get("vapid_public_key", "")
-    return JSONResponse({"public_key": public_key})
 
 
 # ── Serve PWA static files ─────────────────────────────────────────────────────
