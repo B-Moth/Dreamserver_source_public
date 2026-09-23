@@ -1,5 +1,5 @@
 """
-server.py — FastAPI server for Sandman
+server.py - FastAPI server for Sandman
 Receives audio uploads from DreamCatcher
 Automatically transcribes after upload
 Optionally corrects after transcription
@@ -8,7 +8,6 @@ Serves PWA static files over HTTPS
 """
 
 import json
-import hashlib
 import logging
 import re
 import shutil
@@ -17,7 +16,6 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import yaml
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -25,37 +23,19 @@ from fastapi.staticfiles import StaticFiles
 
 from pipeline.transcriber import Transcriber
 from pipeline.corrector import Corrector
-from notifications.push import (
-    add_subscription,
-    remove_subscription,
-    send_transcript_ready,
-)
+from notifications.push import send_transcript_ready
 
-# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [dreamserver] %(message)s")
 log = logging.getLogger(__name__)
 
-# ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
-CONFIG_FILE = Path.home() / "dreamserver" / "config.yaml"
-MISTRAL_INPUTS_FILE = Path.home() / "dreamserver" / "config" / "mistral_inputs.yaml"
-SEMANTIC_GROUPS_FILE = Path.home() / "dreamserver" / "storage" / "semantic_groups.json"
-DIGEST_SUMMARIES_DIR = Path.home() / "dreamserver" / "storage" / "digest_summaries"
-USER_PROFILE_FILE = Path.home() / "dreamserver" / "storage" / "user_profile.json"
-
-_semantic_lock = threading.Lock()
-_semantic_loaded = False
-_semantic_tag_to_group = {}
-_semantic_pending_tags = set()
-_semantic_generation = 0
 _digest_lock = threading.Lock()
 _digest_summary_queue = {}
 _digest_summary_results = {}
@@ -69,47 +49,53 @@ _fallback_retry_lock = threading.Lock()
 _fallback_retry_queue = []
 _fallback_retry_pending = set()
 
-from api.utils import (
-    token_findall,
-    term_findall,
-    word_token_findall,
-)
+from api.utils import token_findall, term_findall, word_token_findall
 from api.interpretation import (
-    build_interpreter_prompt,
-    interpreter_prompt_signature,
-    compact_interpret_prompt,
-    anti_paraphrase_prompt,
-    local_interpretation_fallback,
-    run_interpretation_job,
+    build_interpreter_prompt, interpreter_prompt_signature,
+    compact_interpret_prompt, anti_paraphrase_prompt,
+    local_interpretation_fallback, run_interpretation_job,
     word_overlap_ratio,
 )
-from api.dream_map import (
-    _dream_map_collect_tags,
-    _dream_map_is_content_word,
-    _dream_map_is_keyword,
+from api.digest import fallback_digest_summary as _fallback_digest_summary
+from api.digest import render_digest_prompt as _render_digest_prompt
+from api.config import (
+    DEFAULT_MISTRAL_INPUTS as _DEFAULT_MISTRAL_INPUTS,
+    DIGEST_SUMMARIES_DIR, SEMANTIC_GROUPS_FILE,
+    load_config as _load_config, load_mistral_inputs as _load_mistral_inputs,
 )
+from api.profile import (
+    load_user_profile as _load_user_profile,
+    sanitize_user_profile as _sanitize_user_profile,
+    save_user_profile as _save_user_profile,
+    user_addressing_instruction as _user_addressing_instruction,
+    user_profile_for_prompt as _user_profile_for_prompt,
+    user_profile_signature as _user_profile_signature,
+)
+from api.storage import (
+    entry_path as _entry_path, find_audio as _find_audio,
+    iter_entry_paths as _iter_entry_paths, read_meta as _read_meta,
+    read_preferred_transcript as _read_preferred_transcript,
+    read_transcripts as _read_transcripts, update_meta as _update_meta,
+    write_meta as _write_meta, write_transcript as _write_transcript,
+)
+from api.analytics import (
+    compute_stats as _compute_stats,
+    compute_weekly_digest as _compute_weekly_digest,
+    search_entries as _search_entries,
+)
+from api.semantic_store import SemanticStore
+from api.interpretation_store import InterpretationStore
+
+_semantic_store = SemanticStore(SEMANTIC_GROUPS_FILE, log)
 
 
-def _fallback_retry_key(job: dict) -> str:
-    if job.get("kind") == "digest":
-        return f"digest:{job.get('days')}:{job.get('weeks_ago')}"
-    if job.get("kind") == "interpret":
-        return f"interpret:{job.get('timestamp')}:{job.get('interpreter')}"
-    return f"unknown:{job}"
+def _normalize_tag(tag: str) -> str:
+    return str(tag or "").strip().lower()
 
 
-def _enqueue_fallback_retry(job: dict):
-    key = _fallback_retry_key(job)
-    with _fallback_retry_lock:
-        if key in _fallback_retry_pending:
-            return
-        item = {
-            **job,
-            "next_try_at": float(job.get("next_try_at") or 0),
-            "tries": int(job.get("tries") or 0),
-        }
-        _fallback_retry_queue.append(item)
-        _fallback_retry_pending.add(key)
+_DREAM_MAP_PRONOUNS = set(
+    "je j tu il elle on nous vous ils elles me m te t se s le la les lui leur eux en y ce cet cette ces cela ça ca celui celle ceux celles mien tien sien notre votre leur mon ton son ma ta sa mes tes ses leurs moi toi soi their them they he she we you i".split()
+)
 
 
 def _digest_summary_path(days: int, weeks_ago: int) -> Path:
@@ -117,279 +103,24 @@ def _digest_summary_path(days: int, weeks_ago: int) -> Path:
     return DIGEST_SUMMARIES_DIR / f"weekly_{days}_w{weeks_ago}.json"
 
 
-def _profile_path() -> Path:
-    try:
-        cfg = _load_config()
-        custom = str(cfg.get("profile_file") or "").strip()
-        if custom:
-            p = Path(custom)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            return p
-    except Exception:
-        pass
-    USER_PROFILE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return USER_PROFILE_FILE
-
-
-def _empty_user_profile() -> dict:
-    return {
-        "first_name": "",
-        "last_name": "",
-        "pronouns": "",
-        "birthday": "",
-        "pet": "",
-        "closest_relative": "",
-        "closest_relative_status": "",
-        "other_notes": "",
-        "updated_at": None,
-    }
-
-
-def _sanitize_profile_value(value, limit: int = 280) -> str:
-    v = str(value or "").strip()
-    return v[:limit]
-
-
-def _sanitize_user_profile(payload: dict | None) -> dict:
-    data = payload or {}
-    clean = _empty_user_profile()
-    clean["first_name"] = _sanitize_profile_value(data.get("first_name"), 80)
-    clean["last_name"] = _sanitize_profile_value(data.get("last_name"), 80)
-    clean["pronouns"] = _sanitize_profile_value(data.get("pronouns"), 120)
-    clean["birthday"] = _sanitize_profile_value(data.get("birthday"), 40)
-    clean["pet"] = _sanitize_profile_value(data.get("pet"), 160)
-    clean["closest_relative"] = _sanitize_profile_value(
-        data.get("closest_relative"), 160
-    )
-    clean["closest_relative_status"] = _sanitize_profile_value(
-        data.get("closest_relative_status"), 220
-    )
-    clean["other_notes"] = _sanitize_profile_value(data.get("other_notes"), 500)
-    clean["updated_at"] = datetime.now().isoformat()
-    return clean
-
-
-def _load_user_profile() -> dict:
-    p = _profile_path()
-    if not p.exists():
-        return _empty_user_profile()
-    try:
-        with open(p, "r") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return _empty_user_profile()
-        merged = _empty_user_profile()
-        for k in merged.keys():
-            if k == "updated_at":
-                merged[k] = data.get(k)
-            else:
-                merged[k] = _sanitize_profile_value(
-                    data.get(k), 500 if k == "other_notes" else 280
-                )
-        return merged
-    except Exception:
-        return _empty_user_profile()
-
-
-def _user_profile_for_prompt() -> str:
-    p = _load_user_profile()
-    fields = [
-        ("first_name", "First name"),
-        ("last_name", "Last name"),
-        ("pronouns", "Pronouns"),
-        ("birthday", "Birthday"),
-        ("pet", "Pet"),
-        ("closest_relative", "Closest relative"),
-        ("closest_relative_status", "Relative status"),
-        ("other_notes", "Other relevant notes"),
-    ]
-    lines = []
-    for key, label in fields:
-        value = str(p.get(key) or "").strip()
-        if value:
-            lines.append(f"- {label}: {value}")
-    return "\n".join(lines)
-
-
-def _user_addressing_instruction() -> str:
-    p = _load_user_profile()
-    first_name = str(p.get("first_name") or "").strip()
-    pronouns = str(p.get("pronouns") or "").strip()
-
-    if not first_name and not pronouns:
-        return (
-            "Adresse-toi directement a l'utilisateur en deuxieme personne (tu/ton/tes)."
-        )
-
-    lines = [
-        "Consignes de personnalisation prioritaires:",
-        "- Ecris uniquement en francais.",
-        "- Adresse-toi directement a l'utilisateur en deuxieme personne (tu/ton/tes).",
-    ]
-    if first_name:
-        lines.append(
-            f'- Utilise le prenom "{first_name}" quand tu t\'adresses a la personne.'
-        )
-    if pronouns:
-        normalized = pronouns.lower().replace("·", "").replace(" ", "")
-        lines.append(f'- Pronoms preferes: "{pronouns}".')
-        lines.append(
-            "- N'invente pas et ne traduis pas les pronoms "
-            '(interdit: "they/them" ou "Nom/Them" si ce n\'est pas fourni).'
-        )
-        if "iel" in normalized:
-            lines.append(
-                '- Si une phrase impose la troisieme personne, utilise explicitement "iel" '
-                "et garde une formulation inclusive."
-            )
-        else:
-            lines.append(
-                "- Si une phrase impose la troisieme personne, reprends exactement les pronoms fournis."
-            )
-    lines.append("- Ne commente pas ces consignes dans la reponse.")
-    return "\n".join(lines)
-
-
-def _user_profile_signature() -> str:
-    p = _load_user_profile()
-    payload = {
-        "first_name": p.get("first_name"),
-        "last_name": p.get("last_name"),
-        "pronouns": p.get("pronouns"),
-        "birthday": p.get("birthday"),
-        "pet": p.get("pet"),
-        "closest_relative": p.get("closest_relative"),
-        "closest_relative_status": p.get("closest_relative_status"),
-        "other_notes": p.get("other_notes"),
-    }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _inject_user_profile_addressing(
-    template: str,
-    user_profile: str,
-    user_addressing: str,
-    profile_block_label: str | None = None,
-    addressing_block_label: str | None = None,
-) -> str:
-    """Inject user profile and addressing blocks into a prompt template when missing.
-
-    This centralizes the small, repeated logic used by interpretation prompt builders
-    so changes remain local and consistent. The returned template is unformatted
-    and should then be formatted with the desired keyword arguments.
-    """
-    injected_blocks = []
-    if addressing_block_label is None:
-        addressing_block_label = "Consigne d'adresse prioritaire:"
-    if profile_block_label is None:
-        profile_block_label = "Contexte utilisateur (a prendre en compte dans l'interpretation):"
-
-    if user_addressing and "{user_addressing}" not in template:
-        injected_blocks.append(f"{addressing_block_label}\n{{user_addressing}}")
-    if user_profile and "{user_profile}" not in template:
-        injected_blocks.append(f"{profile_block_label}\n{{user_profile}}")
-
-    if injected_blocks:
-        template = "\n\n".join(injected_blocks + [template])
-    return template
-
-
-def _load_persisted_digest_summary(days: int, weeks_ago: int):
-    p = _digest_summary_path(days, weeks_ago)
-    if not p.exists():
-        return None
-    try:
-        with open(p, "r") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return None
-        if not data.get("summary"):
-            return None
-        persisted_profile_sig = data.get("profile_signature")
-        current_profile_sig = _user_profile_signature()
-        if persisted_profile_sig != current_profile_sig:
-            return None
-        return {
-            "source": data.get("source") or "fallback",
-            "summary": data.get("summary") or "",
-            "digest": data.get("digest") or {},
-            "created_at": data.get("created_at"),
-            "generation_seconds": data.get("generation_seconds"),
-            "profile_signature": data.get("profile_signature"),
-        }
-    except Exception:
-        return None
-
-
-def _persist_digest_summary(days: int, weeks_ago: int, payload: dict):
-    p = _digest_summary_path(days, weeks_ago)
-    to_store = {
-        "source": payload.get("source"),
-        "summary": payload.get("summary"),
-        "digest": payload.get("digest"),
-        "created_at": datetime.now().isoformat(),
-        "generation_seconds": payload.get("generation_seconds"),
-        "profile_signature": payload.get("profile_signature")
-        or _user_profile_signature(),
-    }
-    with open(p, "w") as f:
-        json.dump(to_store, f, ensure_ascii=False, indent=2)
-
-
-def _build_persisted_fallback_result(
-    days: int, weeks_ago: int, reason: str = ""
-) -> dict:
-    payload = _compute_weekly_digest_payload(days, weeks_ago)
-    summary = _fallback_digest_summary(payload)
-    if reason:
-        summary = f"{summary}\n\n(note: {reason})"
-    result = {
-        "source": "fallback",
-        "summary": summary,
-        "digest": payload,
-        "created_at": datetime.now().isoformat(),
-        "generation_seconds": 0,
-        "profile_signature": _user_profile_signature(),
-    }
-    _persist_digest_summary(days, weeks_ago, result)
-    return result
-
-
 def _interpretation_meta_path(entry_dir: Path, interpreter_key: str) -> Path:
     return entry_dir / f"interpretation_{interpreter_key}.json"
 
 
 def _read_interpretation_meta(entry_dir: Path, interpreter_key: str) -> dict:
-    meta_path = _interpretation_meta_path(entry_dir, interpreter_key)
-    if not meta_path.exists():
-        return {
-            "source": "mistral",
-            "generation_seconds": None,
-            "prompt_signature": None,
-        }
+    path = _interpretation_meta_path(entry_dir, interpreter_key)
+    if not path.exists():
+        return {}
     try:
-        with open(meta_path, "r") as f:
-            data = json.load(f)
-        source = str(data.get("source") or "mistral").strip().lower() or "mistral"
-        generation_seconds = data.get("generation_seconds")
-        return {
-            "source": source,
-            "generation_seconds": generation_seconds,
-            "prompt_signature": data.get("prompt_signature"),
-        }
+        with open(path) as meta_file:
+            data = json.load(meta_file)
+        return data if isinstance(data, dict) else {}
     except Exception:
-        return {
-            "source": "mistral",
-            "generation_seconds": None,
-            "prompt_signature": None,
-        }
+        return {}
 
 
 def _read_interpretation_source(entry_dir: Path, interpreter_key: str) -> str:
-    return (
-        _read_interpretation_meta(entry_dir, interpreter_key).get("source") or "mistral"
-    )
+    return _read_interpretation_meta(entry_dir, interpreter_key).get("source") or "mistral"
 
 
 def _write_interpretation(
@@ -409,8 +140,76 @@ def _write_interpretation(
         "prompt_signature": prompt_signature,
         "updated_at": datetime.now().isoformat(),
     }
-    with open(meta_path, "w") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    with open(meta_path, "w") as meta_file:
+        json.dump(payload, meta_file, ensure_ascii=False, indent=2)
+
+
+def _fallback_retry_key(job: dict) -> str:
+    if job.get("kind") == "digest":
+        return f"digest:{job.get('days')}:{job.get('weeks_ago')}"
+    if job.get("kind") == "interpret":
+        return f"interpret:{job.get('timestamp')}:{job.get('interpreter')}"
+    return f"unknown:{job}"
+
+
+def _enqueue_fallback_retry(job: dict):
+    key = _fallback_retry_key(job)
+    with _fallback_retry_lock:
+        if key in _fallback_retry_pending:
+            return
+        _fallback_retry_queue.append({
+            **job,
+            "next_try_at": float(job.get("next_try_at") or 0),
+            "tries": int(job.get("tries") or 0),
+        })
+        _fallback_retry_pending.add(key)
+
+
+def _load_persisted_digest_summary(days: int, weeks_ago: int):
+    path = _digest_summary_path(days, weeks_ago)
+    if not path.exists():
+        return None
+    try:
+        with open(path) as summary_file:
+            data = json.load(summary_file)
+        if not isinstance(data, dict) or not data.get("summary"):
+            return None
+        if data.get("profile_signature") != _user_profile_signature():
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _persist_digest_summary(days: int, weeks_ago: int, payload: dict):
+    path = _digest_summary_path(days, weeks_ago)
+    stored = {
+        "source": payload.get("source"),
+        "summary": payload.get("summary"),
+        "digest": payload.get("digest"),
+        "created_at": datetime.now().isoformat(),
+        "generation_seconds": payload.get("generation_seconds"),
+        "profile_signature": payload.get("profile_signature") or _user_profile_signature(),
+    }
+    with open(path, "w") as summary_file:
+        json.dump(stored, summary_file, ensure_ascii=False, indent=2)
+
+
+def _build_persisted_fallback_result(days: int, weeks_ago: int, reason: str = "") -> dict:
+    payload = _compute_weekly_digest_payload(days, weeks_ago)
+    summary = _fallback_digest_summary(payload)
+    if reason:
+        summary = f"{summary}\n\n(note: {reason})"
+    result = {
+        "source": "fallback",
+        "summary": summary,
+        "digest": payload,
+        "created_at": datetime.now().isoformat(),
+        "generation_seconds": 0,
+        "profile_signature": _user_profile_signature(),
+    }
+    _persist_digest_summary(days, weeks_ago, result)
+    return result
 
 
 def _normalize_timeout_seconds(raw_value, default_seconds: int):
@@ -499,100 +298,6 @@ def _maintenance_loop():
             log.warning(f"Off-hours maintenance error: {e}")
 
         time.sleep(300)
-
-
-_DEFAULT_MISTRAL_INPUTS = {
-    "interpretation": {
-        "prompts": {
-            "fool": (
-                "Tu es Le Fou, interprète de rêves facétieux inspiré du fou du roi. "
-                "Donne une lecture symbolique et psychologique SANS résumer le récit ni répéter les scènes. "
-                "Structure: 1) tension intérieure probable, 2) angle absurde éclairant, "
-                "3) mini-conseil concret pour demain. 3 phrases maximum. Pas d'introduction.\n\n"
-                "Rêve: {text}"
-            ),
-            "freud": (
-                "Tu es Sigmund, interprète de rêves analytique inspiré de Freud. "
-                "Analyse SANS paraphraser le rêve: identifie le conflit psychique central, "
-                "le désir/peur sous-jacent, puis une hypothèse de mécanisme (défense, déplacement, etc.). "
-                "3 phrases maximum. Pas d'introduction.\n\n"
-                "Rêve: {text}"
-            ),
-            "cassandra": (
-                "Tu es Cassandre, prophétesse mystique. "
-                "Interprète les symboles en profondeur SANS raconter le rêve. "
-                "Donne: 1) symbole maître, 2) mouvement intérieur qu'il annonce, "
-                "3) geste rituel simple pour intégrer le message. "
-                "3 phrases maximum, poétiques mais claires, sans introduction.\n\n"
-                "Rêve: {text}"
-            ),
-            "oracle": (
-                "Tu es un oracle bienveillant. "
-                "Interprète ce rêve SANS le reformuler: cible le besoin émotionnel principal, "
-                "l'élan de transformation, et un conseil actionnable pour la journée. "
-                "3 phrases maximum. Ton chaleureux, pas d'introduction.\n\n"
-                "Rêve: {text}"
-            ),
-        },
-        "compact_template": (
-            "Tu es {interpreter_name}. Interprète ce rêve en 2 phrases courtes, "
-            "claires et concrètes, sans introduction.\n\n"
-            'Rêve: "{text}"'
-        ),
-        "anti_paraphrase_template": (
-            "Tu es {interpreter_name}. INTERDIT: résumer, reformuler ou citer les scènes du rêve. "
-            "Réponds en 3 lignes courtes: (1) dynamique émotionnelle, "
-            "(2) sens latent, (3) micro-action concrète aujourd'hui.\n\n"
-            'Rêve: "{compact_text}"'
-        ),
-    },
-    "dream_map": {
-        "tag_classifier_template": (
-            "Tu classes un tag de rêve dans un groupe sémantique. "
-            "Si aucun groupe existant n'est suffisamment proche, crée un NOUVEAU groupe court (1-3 mots). "
-            'Réponds STRICTEMENT en JSON valide au format: {"group":"...","existing":true|false}. '
-            "Pas de texte autour.\n\n"
-            "Tag: {tag}\n"
-            "Groupes existants: {groups_json}"
-        )
-    },
-    "digest": {
-        "weekly_summary_template": (
-            "Tu es analyste de journal de reves. "
-            "A partir du digest JSON ci-dessous, ecris un resume en 4 a 5 phrases maximum, "
-            "en francais naturel, concret et utile, sans inventer de donnees. "
-            "Mentionne le climat general (tension), les themes dominants et une piste d'action simple.\n\n"
-            "Jours couverts: {days}\n"
-            "Digest JSON: {digest_json}"
-        )
-    },
-}
-
-
-def _load_config():
-    with open(CONFIG_FILE) as f:
-        return yaml.safe_load(f)
-
-
-def _deep_merge_dict(base: dict, override: dict) -> dict:
-    merged = dict(base or {})
-    for k, v in (override or {}).items():
-        if isinstance(v, dict) and isinstance(merged.get(k), dict):
-            merged[k] = _deep_merge_dict(merged[k], v)
-        else:
-            merged[k] = v
-    return merged
-
-
-def _load_mistral_inputs():
-    data = {}
-    if MISTRAL_INPUTS_FILE.exists():
-        try:
-            with open(MISTRAL_INPUTS_FILE) as f:
-                data = yaml.safe_load(f) or {}
-        except Exception as e:
-            log.warning(f"Failed to load mistral inputs config: {e}")
-    return _deep_merge_dict(_DEFAULT_MISTRAL_INPUTS, data)
 
 
 # ── Pipeline callbacks ─────────────────────────────────────────────────────────
@@ -684,75 +389,6 @@ def _apply_dream_date_fallback(meta: dict):
         meta["dream_date"] = meta["received_at"]
     return meta
 
-
-def _normalize_tag(tag: str) -> str:
-    return str(tag or "").strip().lower()
-
-
-_DREAM_MAP_PRONOUNS = {
-    "je",
-    "j",
-    "tu",
-    "il",
-    "elle",
-    "on",
-    "nous",
-    "vous",
-    "ils",
-    "elles",
-    "me",
-    "m",
-    "te",
-    "t",
-    "se",
-    "s",
-    "le",
-    "la",
-    "les",
-    "lui",
-    "leur",
-    "eux",
-    "en",
-    "y",
-    "ce",
-    "cet",
-    "cette",
-    "ces",
-    "cela",
-    "ça",
-    "ca",
-    "celui",
-    "celle",
-    "ceux",
-    "celles",
-    "mien",
-    "tien",
-    "sien",
-    "notre",
-    "votre",
-    "leur",
-    "mon",
-    "ton",
-    "son",
-    "ma",
-    "ta",
-    "sa",
-    "mes",
-    "tes",
-    "ses",
-    "leurs",
-    "moi",
-    "toi",
-    "soi",
-    "their",
-    "them",
-    "they",
-    "he",
-    "she",
-    "we",
-    "you",
-    "i",
-}
 
 _DREAM_MAP_PREPOSITIONS = {
     "a",
@@ -1007,7 +643,6 @@ _DREAM_MAP_VERB_SUFFIXES = (
 )
 
 _DREAM_MAP_EXCLUDED_WORDS = set().union(
-    _DREAM_MAP_PRONOUNS,
     _DREAM_MAP_PREPOSITIONS,
     _DREAM_MAP_INTERJECTIONS,
     _DREAM_MAP_ADVERBS,
@@ -1122,60 +757,19 @@ def _dream_map_collect_tags(entries_dir: Path) -> list[str]:
 
 
 def _ensure_semantic_store_loaded():
-    global _semantic_loaded, _semantic_tag_to_group
-    if _semantic_loaded:
-        return
-    with _semantic_lock:
-        if _semantic_loaded:
-            return
-        if SEMANTIC_GROUPS_FILE.exists():
-            try:
-                with open(SEMANTIC_GROUPS_FILE) as f:
-                    data = json.load(f)
-                stored = data.get("tag_to_group", {}) if isinstance(data, dict) else {}
-                _semantic_tag_to_group = {
-                    _normalize_tag(k): str(v).strip()
-                    for k, v in stored.items()
-                    if _normalize_tag(k) and str(v).strip()
-                }
-            except Exception as e:
-                log.warning(f"Failed to load semantic groups store: {e}")
-                _semantic_tag_to_group = {}
-        _semantic_loaded = True
+    _semantic_store.ensure_loaded()
 
 
 def _reset_semantic_store():
-    global _semantic_loaded, _semantic_tag_to_group, _semantic_pending_tags, _semantic_generation
-    with _semantic_lock:
-        _semantic_generation += 1
-        _semantic_tag_to_group = {}
-        _semantic_pending_tags = set()
-        _semantic_loaded = True
-    try:
-        if SEMANTIC_GROUPS_FILE.exists():
-            SEMANTIC_GROUPS_FILE.unlink()
-    except Exception as e:
-        log.warning(f"Failed to clear semantic groups store: {e}")
+    _semantic_store.reset()
 
 
 def _current_semantic_generation() -> int:
-    with _semantic_lock:
-        return int(_semantic_generation)
+    return _semantic_store.current_generation()
 
 
 def _save_semantic_store():
-    with _semantic_lock:
-        SEMANTIC_GROUPS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": 1,
-            "updated_at": datetime.now().isoformat(),
-            "generation": _semantic_generation,
-            "tag_to_group": _semantic_tag_to_group,
-        }
-        tmp = SEMANTIC_GROUPS_FILE.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-        tmp.replace(SEMANTIC_GROUPS_FILE)
+    _semantic_store.save()
 
 
 def _classify_tag_with_mistral(tag: str):
@@ -1184,8 +778,7 @@ def _classify_tag_with_mistral(tag: str):
     ollama_cfg = cfg.get("ollama", {})
     host = ollama_cfg.get("host", "http://127.0.0.1:11434")
     model = ollama_cfg.get("model", "mistral")
-    with _semantic_lock:
-        groups = sorted({v for v in _semantic_tag_to_group.values() if str(v).strip()})
+    groups = _semantic_store.groups()
 
     inputs = _load_mistral_inputs()
     prompt_template = inputs.get("dream_map", {}).get(
@@ -1235,15 +828,13 @@ def _classify_tag_background(tag: str, generation: int):
             return
         group = _classify_tag_with_mistral(tag)
         if group and generation == _current_semantic_generation():
-            with _semantic_lock:
-                _semantic_tag_to_group[tag] = group
+            _semantic_store.assign(tag, group, generation)
             _save_semantic_store()
             log.info(f"Semantic group assigned: {tag} -> {group}")
         else:
             log.warning(f"No semantic group assigned yet for tag: {tag}")
     finally:
-        with _semantic_lock:
-            _semantic_pending_tags.discard(tag)
+        _semantic_store.finish_tag(tag)
 
 
 def _enqueue_tag_semantic_classification(tag: str, generation: int | None = None):
@@ -1251,13 +842,9 @@ def _enqueue_tag_semantic_classification(tag: str, generation: int | None = None
     if not t:
         return
     _ensure_semantic_store_loaded()
-    with _semantic_lock:
-        if t in _semantic_tag_to_group or t in _semantic_pending_tags:
-            return
-        current_generation = (
-            _semantic_generation if generation is None else int(generation)
-        )
-        _semantic_pending_tags.add(t)
+    current_generation = _semantic_store.begin_tag(t, generation)
+    if current_generation is None:
+        return
     threading.Thread(
         target=_classify_tag_background, args=(t, current_generation), daemon=True
     ).start()
@@ -1299,7 +886,7 @@ async def upload(
 
     config = _load_config()
     entries_dir = Path(config["storage"]["entries_dir"])
-    entry_dir = entries_dir / timestamp
+    entry_dir = _entry_path(entries_dir, timestamp)
     entry_dir.mkdir(parents=True, exist_ok=True)
 
     # Save audio file preserving original extension
@@ -1322,8 +909,7 @@ async def upload(
         "notified": False,
         "sent": False,
     }
-    with open(entry_dir / "meta.json", "w") as f:
-        json.dump(meta, f, indent=2)
+    _write_meta(entry_dir, meta)
 
     threading.Thread(target=transcriber.enqueue, args=[entry_dir], daemon=True).start()
 
@@ -1344,11 +930,11 @@ async def create_manual_entry(request: Request, x_api_key: str = Header(None)):
     config = _load_config()
     entries_dir = Path(config["storage"]["entries_dir"])
     timestamp = datetime.now().strftime("%Y-%m-%d_%Hh%M")
-    entry_dir = entries_dir / timestamp
+    entry_dir = _entry_path(entries_dir, timestamp)
     entry_dir.mkdir(parents=True, exist_ok=True)
 
-    (entry_dir / "transcript_raw.txt").write_text(text)
-    (entry_dir / "transcript_corrected.txt").write_text(text)
+    _write_transcript(entry_dir, "raw", text)
+    _write_transcript(entry_dir, "corrected", text)
 
     meta = {
         "timestamp": timestamp,
@@ -1361,8 +947,7 @@ async def create_manual_entry(request: Request, x_api_key: str = Header(None)):
         "notified": False,
         "sent": False,
     }
-    with open(entry_dir / "meta.json", "w") as f:
-        json.dump(meta, f, indent=2)
+    _write_meta(entry_dir, meta)
 
     log.info(f"Manual entry created: {timestamp}")
     return JSONResponse({"status": "ok", "entry": timestamp})
@@ -1377,14 +962,9 @@ def list_entries(x_api_key: str = Header(None)):
     entries_dir = Path(config["storage"]["entries_dir"])
     entries = []
     if entries_dir.exists():
-        for entry in sorted(entries_dir.iterdir(), reverse=True):
-            if not entry.is_dir():
-                continue
-            meta_file = entry / "meta.json"
-            if meta_file.exists():
-                with open(meta_file) as f:
-                    meta = json.load(f)
-
+        for entry in _iter_entry_paths(entries_dir):
+            meta = _read_meta(entry)
+            if meta is not None:
                 _apply_dream_date_fallback(meta)
 
                 # Surface interpretation background activity at entry level.
@@ -1396,15 +976,9 @@ def list_entries(x_api_key: str = Header(None)):
                 )
 
                 # Add transcript preview — prefer user > corrected > raw
-                user = entry / "transcript_user.txt"
-                corrected = entry / "transcript_corrected.txt"
-                raw = entry / "transcript_raw.txt"
-                if user.exists():
-                    meta["transcript_preview"] = user.read_text()[:150]
-                elif corrected.exists():
-                    meta["transcript_preview"] = corrected.read_text()[:150]
-                elif raw.exists():
-                    meta["transcript_preview"] = raw.read_text()[:150]
+                preview = _read_preferred_transcript(entry)
+                if preview:
+                    meta["transcript_preview"] = preview[:150]
                 entries.append(meta)
     return JSONResponse(entries)
 
@@ -1415,30 +989,16 @@ def get_entry(timestamp: str, x_api_key: str = Header(None)):
     _verify_api_key(x_api_key)
     config = _load_config()
     entries_dir = Path(config["storage"]["entries_dir"])
-    entry_dir = entries_dir / timestamp
+    entry_dir = _entry_path(entries_dir, timestamp)
 
     if not entry_dir.exists():
         raise HTTPException(status_code=404, detail="Entry not found")
 
-    meta_file = entry_dir / "meta.json"
-    meta = {}
-    if meta_file.exists():
-        with open(meta_file) as f:
-            meta = json.load(f)
+    meta = _read_meta(entry_dir) or {}
 
     _apply_dream_date_fallback(meta)
 
-    raw_file = entry_dir / "transcript_raw.txt"
-    if raw_file.exists():
-        meta["transcript_raw"] = raw_file.read_text()
-
-    corrected_file = entry_dir / "transcript_corrected.txt"
-    if corrected_file.exists():
-        meta["transcript_corrected"] = corrected_file.read_text()
-
-    user_file = entry_dir / "transcript_user.txt"
-    if user_file.exists():
-        meta["transcript_user"] = user_file.read_text()
+    meta.update(_read_transcripts(entry_dir))
 
     return JSONResponse(meta)
 
@@ -1449,9 +1009,9 @@ def get_audio(timestamp: str, x_api_key: str = Header(None)):
     _verify_api_key(x_api_key)
     config = _load_config()
     entries_dir = Path(config["storage"]["entries_dir"])
-    entry_dir = entries_dir / timestamp
+    entry_dir = _entry_path(entries_dir, timestamp)
 
-    audio = next(entry_dir.glob("audio.*"), None)
+    audio = _find_audio(entry_dir)
     if not audio:
         raise HTTPException(status_code=404, detail="Audio not found")
 
@@ -1464,18 +1024,13 @@ def correct_entry(timestamp: str, x_api_key: str = Header(None)):
     _verify_api_key(x_api_key)
     config = _load_config()
     entries_dir = Path(config["storage"]["entries_dir"])
-    entry_dir = entries_dir / timestamp
+    entry_dir = _entry_path(entries_dir, timestamp)
 
     if not entry_dir.exists():
         raise HTTPException(status_code=404, detail="Entry not found")
 
-    meta_file = entry_dir / "meta.json"
-    if meta_file.exists():
-        with open(meta_file) as f:
-            meta = json.load(f)
-        meta["corrected"] = False
-        with open(meta_file, "w") as f:
-            json.dump(meta, f, indent=2)
+    if _read_meta(entry_dir) is not None:
+        _update_meta(entry_dir, {"corrected": False})
 
     corrector.enqueue(entry_dir)
     return JSONResponse(
@@ -1489,7 +1044,7 @@ async def update_tags(timestamp: str, request: Request, x_api_key: str = Header(
     _verify_api_key(x_api_key)
     config = _load_config()
     entries_dir = Path(config["storage"]["entries_dir"])
-    entry_dir = entries_dir / timestamp
+    entry_dir = _entry_path(entries_dir, timestamp)
 
     if not entry_dir.exists():
         raise HTTPException(status_code=404, detail="Entry not found")
@@ -1497,12 +1052,9 @@ async def update_tags(timestamp: str, request: Request, x_api_key: str = Header(
     body = await request.json()
     tags = body.get("tags", [])
 
-    meta_file = entry_dir / "meta.json"
-    with open(meta_file) as f:
-        meta = json.load(f)
+    meta = _read_meta(entry_dir) or {}
     meta["tags"] = tags
-    with open(meta_file, "w") as f:
-        json.dump(meta, f, indent=2)
+    _write_meta(entry_dir, meta)
 
     # Classify newly added tags in background for Dream Map semantic grouping.
     for tag in tags:
@@ -1520,7 +1072,7 @@ async def save_transcript(
     _verify_api_key(x_api_key)
     config = _load_config()
     entries_dir = Path(config["storage"]["entries_dir"])
-    entry_dir = entries_dir / timestamp
+    entry_dir = _entry_path(entries_dir, timestamp)
 
     if not entry_dir.exists():
         raise HTTPException(status_code=404, detail="Entry not found")
@@ -1530,7 +1082,7 @@ async def save_transcript(
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
 
-    (entry_dir / "transcript_user.txt").write_text(text)
+    _write_transcript(entry_dir, "user", text)
     log.info(f"User transcript saved: {timestamp}")
     return JSONResponse({"status": "ok"})
 
@@ -1543,7 +1095,7 @@ async def update_dream_date(
     _verify_api_key(x_api_key)
     config = _load_config()
     entries_dir = Path(config["storage"]["entries_dir"])
-    entry_dir = entries_dir / timestamp
+    entry_dir = _entry_path(entries_dir, timestamp)
 
     if not entry_dir.exists():
         raise HTTPException(status_code=404, detail="Entry not found")
@@ -1553,16 +1105,11 @@ async def update_dream_date(
     if dream_date is None:
         raise HTTPException(status_code=400, detail="dream_date is required")
 
-    meta_file = entry_dir / "meta.json"
-    meta = {}
-    if meta_file.exists():
-        with open(meta_file) as f:
-            meta = json.load(f)
+    meta = _read_meta(entry_dir) or {}
 
     meta["dream_date"] = dream_date
 
-    with open(meta_file, "w") as f:
-        json.dump(meta, f, indent=2)
+    _write_meta(entry_dir, meta)
 
     log.info(f"Dream date updated for {timestamp}: {dream_date}")
     return JSONResponse({"status": "ok", "dream_date": dream_date})
@@ -1574,7 +1121,7 @@ def delete_entry(timestamp: str, x_api_key: str = Header(None)):
     _verify_api_key(x_api_key)
     config = _load_config()
     entries_dir = Path(config["storage"]["entries_dir"])
-    entry_dir = entries_dir / timestamp
+    entry_dir = _entry_path(entries_dir, timestamp)
 
     if not entry_dir.exists():
         raise HTTPException(status_code=404, detail="Entry not found")
@@ -1636,9 +1183,10 @@ def _interpretation_prompt_signature(interpreter_key: str) -> str:
 
 
 # Track in-progress interpretations
-_interpretation_queue = {}
-_interpretation_errors = {}
-_interpretation_job_tokens = {}
+_interpretation_store = InterpretationStore()
+_interpretation_queue = _interpretation_store.queue
+_interpretation_errors = _interpretation_store.errors
+_interpretation_job_tokens = _interpretation_store.tokens
 
 
 def _cleanup_stale_interpretations():
@@ -2093,9 +1641,7 @@ def get_dream_map(x_api_key: str = Header(None)):
                 if _dream_map_is_content_word(t):
                     word_counts[t] = word_counts.get(t, 0) + 1
 
-    with _semantic_lock:
-        cache_snapshot = dict(_semantic_tag_to_group)
-        pending_snapshot = set(_semantic_pending_tags)
+    cache_snapshot, pending_snapshot = _semantic_store.snapshot()
 
     sorted_tags = sorted(tag_counts.items(), key=lambda x: -x[1])
     selected_tags = []
@@ -2135,9 +1681,7 @@ def get_dream_map(x_api_key: str = Header(None)):
     ]
     nodes = []
 
-    with _semantic_lock:
-        cache = dict(_semantic_tag_to_group)
-        pending = set(_semantic_pending_tags)
+    cache, pending = _semantic_store.snapshot()
 
     for n in tag_nodes:
         label = _normalize_tag(n["label"])
@@ -2188,285 +1732,11 @@ def reset_dream_map(x_api_key: str = Header(None)):
 
 @app.get("/stats")
 def get_stats(x_api_key: str = Header(None)):
-    """Compute statistics across all entries."""
+    """Return statistics computed from all transcribed entries."""
     _verify_api_key(x_api_key)
     config = _load_config()
     entries_dir = Path(config["storage"]["entries_dir"])
-
-    if not entries_dir.exists():
-        return JSONResponse({})
-
-    # French stopwords
-    STOPWORDS = {
-        "je",
-        "tu",
-        "il",
-        "elle",
-        "nous",
-        "vous",
-        "ils",
-        "elles",
-        "me",
-        "te",
-        "se",
-        "le",
-        "la",
-        "les",
-        "un",
-        "une",
-        "des",
-        "du",
-        "de",
-        "d",
-        "l",
-        "y",
-        "en",
-        "et",
-        "est",
-        "était",
-        "être",
-        "avoir",
-        "que",
-        "qui",
-        "quoi",
-        "dont",
-        "où",
-        "ou",
-        "et",
-        "mais",
-        "donc",
-        "or",
-        "ni",
-        "car",
-        "si",
-        "plus",
-        "très",
-        "bien",
-        "tout",
-        "tous",
-        "cette",
-        "ce",
-        "cet",
-        "ces",
-        "mon",
-        "ton",
-        "son",
-        "ma",
-        "ta",
-        "sa",
-        "nos",
-        "vos",
-        "leurs",
-        "leur",
-        "au",
-        "aux",
-        "par",
-        "pour",
-        "sur",
-        "sous",
-        "dans",
-        "avec",
-        "sans",
-        "entre",
-        "vers",
-        "chez",
-        "après",
-        "avant",
-        "pendant",
-        "alors",
-        "puis",
-        "aussi",
-        "même",
-        "comme",
-        "quand",
-        "car",
-        "encore",
-        "déjà",
-        "jamais",
-        "toujours",
-        "pas",
-        "ne",
-        "plus",
-        "rien",
-        "personne",
-        "non",
-        "oui",
-        "ah",
-        "oh",
-        "a",
-        "à",
-        "ça",
-        "là",
-        "lui",
-        "eux",
-        "on",
-        "j",
-        "m",
-        "t",
-        "s",
-        "c",
-        "n",
-        "qu",
-        "j'ai",
-        "j'étais",
-        "c'est",
-        "c'était",
-        "il",
-        "avait",
-        "était",
-        "fait",
-        "faire",
-        "aller",
-        "venir",
-        "voir",
-        "savoir",
-        "pouvoir",
-        "vouloir",
-        "falloir",
-        "avoir",
-        "être",
-        "dit",
-        "allait",
-        "venait",
-        "ai",
-        "as",
-        "ont",
-        "une",
-        "the",
-        "and",
-        "but",
-        "with",
-        "from",
-        "this",
-        "that",
-        "they",
-        "them",
-        "their",
-    }
-
-    # Normalize French elisions so stats don't surface fragments like "avais" from "j'avais".
-    elision_prefixes = (
-        "d'",
-        "l'",
-        "j'",
-        "t'",
-        "m'",
-        "n'",
-        "s'",
-        "c'",
-        "qu'",
-        "puisqu'",
-        "lorsqu'",
-        "d’",
-        "l’",
-        "j’",
-        "t’",
-        "m’",
-        "n’",
-        "s’",
-        "c’",
-        "qu’",
-        "puisqu’",
-        "lorsqu’",
-    )
-
-    def _stats_tokens(text: str):
-        tokens = re.findall(r"[a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ'’\-]{2,}", (text or "").lower())
-        normalized = []
-        for token in tokens:
-            t = token.strip("-'’")
-            for prefix in elision_prefixes:
-                if t.startswith(prefix):
-                    t = t[len(prefix) :]
-                    break
-            t = t.strip("-'’")
-            if len(t) >= 4 and t not in STOPWORDS:
-                normalized.append(t)
-        return normalized
-
-    entries = []
-    all_words = []
-    tag_counts = {}
-    tag_counts_30 = {}
-    total_chars = 0
-    monthly = {}
-    from datetime import datetime, timedelta
-
-    now = datetime.now()
-    cutoff_30 = now - timedelta(days=30)
-
-    for entry in entries_dir.iterdir():
-        if not entry.is_dir():
-            continue
-        meta_file = entry / "meta.json"
-        if not meta_file.exists():
-            continue
-        with open(meta_file) as f:
-            meta = json.load(f)
-
-        if not meta.get("transcribed"):
-            continue
-
-        entries.append(meta)
-
-        # Parse date
-        try:
-            ts = meta.get("timestamp", "")
-            date_str = ts.split("_")[0]
-            entry_date = datetime.strptime(date_str, "%Y-%m-%d")
-            month_key = entry_date.strftime("%Y-%m")
-            monthly[month_key] = monthly.get(month_key, 0) + 1
-            is_recent = entry_date >= cutoff_30
-        except Exception:
-            is_recent = False
-            month_key = None
-
-        # Transcript length
-        for fname in [
-            "transcript_user.txt",
-            "transcript_corrected.txt",
-            "transcript_raw.txt",
-        ]:
-            f = entry / fname
-            if f.exists():
-                text = f.read_text().strip()
-                total_chars += len(text)
-
-                # Word frequency — robust French tokenization with apostrophe handling.
-                all_words.extend(_stats_tokens(text))
-                break
-
-        # Tags
-        for tag in meta.get("tags", []):
-            tag_counts[tag] = tag_counts.get(tag, 0) + 1
-            if is_recent:
-                tag_counts_30[tag] = tag_counts_30.get(tag, 0) + 1
-
-    total = len(entries)
-    avg_length = round(total_chars / total) if total > 0 else 0
-
-    # Top words
-    from collections import Counter
-
-    word_freq = Counter(all_words).most_common(30)
-
-    # Monthly sorted
-    sorted_monthly = dict(sorted(monthly.items()))
-    months_list = list(sorted_monthly.items())[-12:]  # last 12 months
-
-    avg_per_month = round(total / max(len(sorted_monthly), 1), 1) if total > 0 else 0
-
-    return JSONResponse(
-        {
-            "total_entries": total,
-            "avg_length": avg_length,
-            "avg_per_month": avg_per_month,
-            "top_tags": sorted(tag_counts.items(), key=lambda x: -x[1])[:15],
-            "top_tags_30": sorted(tag_counts_30.items(), key=lambda x: -x[1])[:10],
-            "top_words": word_freq,
-            "monthly": months_list,
-        }
-    )
+    return JSONResponse(_compute_stats(entries_dir))
 
 
 @app.get("/digest/weekly")
@@ -2477,6 +1747,12 @@ def weekly_digest(days: int = 7, weeks_ago: int = 0, x_api_key: str = Header(Non
 
 
 def _compute_weekly_digest_payload(days: int = 7, weeks_ago: int = 0):
+    config = _load_config()
+    entries_dir = Path(config["storage"]["entries_dir"])
+    return _compute_weekly_digest(entries_dir, days, weeks_ago)
+
+
+def _legacy_compute_weekly_digest_payload(days: int = 7, weeks_ago: int = 0):
     config = _load_config()
     entries_dir = Path(config["storage"]["entries_dir"])
 
@@ -2755,136 +2031,6 @@ def _compute_weekly_digest_payload(days: int = 7, weeks_ago: int = 0):
     }
 
 
-def _fallback_digest_summary(payload: dict) -> str:
-    total = int(payload.get("total_entries") or 0)
-    nightmares = int(payload.get("nightmare_entries") or 0)
-    tension = payload.get("tension_level") or "low"
-    top_tags = [t for t, _ in (payload.get("top_tags") or [])[:3]]
-    top_words = [w for w, _ in (payload.get("top_words") or [])[:4]]
-
-    if total == 0:
-        return "Peu de donnees cette semaine: aucun reve transcrit sur la periode. Relance le digest apres de nouvelles entrees pour obtenir une synthese utile."
-
-    return (
-        f"Sur les {payload.get('days', 7)} derniers jours, {total} reves ont ete enregistres, dont {nightmares} a tonalite cauchemardesque. "
-        f"Le niveau global de tension ressort comme {tension}. "
-        f"Les themes qui reviennent le plus sont: {', '.join(top_tags) if top_tags else 'aucun tag dominant net'}. "
-        f"Le vocabulaire recurrent met en avant: {', '.join(top_words) if top_words else 'peu de mots dominants'}. "
-        "Piste utile: note au reveil un mot-emotion principal pour comparer son evolution sur les prochains jours."
-    )
-
-
-def _compact_digest_for_prompt(payload: dict) -> dict:
-    """Reduce prompt size to improve Ollama response latency/reliability."""
-    highlights = payload.get("highlights") or []
-    compact_highlights = []
-    for h in highlights[:4]:
-        compact_highlights.append(
-            {
-                "date": h.get("dream_date") or h.get("timestamp"),
-                "nightmare": bool(h.get("nightmare")),
-                "tags": (h.get("tags") or [])[:4],
-                "preview": str(h.get("preview") or "")[:110],
-            }
-        )
-
-    return {
-        "days": payload.get("days"),
-        "weeks_ago": payload.get("weeks_ago"),
-        "window_start": payload.get("window_start"),
-        "window_end": payload.get("window_end"),
-        "total_entries": payload.get("total_entries"),
-        "nightmare_entries": payload.get("nightmare_entries"),
-        "nightmare_ratio": payload.get("nightmare_ratio"),
-        "tension_level": payload.get("tension_level"),
-        "top_tags": (payload.get("top_tags") or [])[:8],
-        "top_words": (payload.get("top_words") or [])[:10],
-        "daily": payload.get("daily") or [],
-        "highlights": compact_highlights,
-    }
-
-
-def _digest_brief_for_prompt(payload: dict) -> str:
-    """Build a compact textual brief for local CPU LLMs."""
-    top_tags = (
-        ", ".join([str(t) for t, _ in (payload.get("top_tags") or [])[:6]]) or "none"
-    )
-    top_words = (
-        ", ".join([str(w) for w, _ in (payload.get("top_words") or [])[:8]]) or "none"
-    )
-    highlights = payload.get("highlights") or []
-    highlight_lines = []
-    for h in highlights[:3]:
-        date = h.get("dream_date") or h.get("timestamp") or "unknown-date"
-        tags = ", ".join((h.get("tags") or [])[:3])
-        prev = str(h.get("preview") or "").replace("\n", " ").strip()[:90]
-        nightmare = "yes" if h.get("nightmare") else "no"
-        highlight_lines.append(
-            f"- {date} | nightmare={nightmare} | tags={tags or 'none'} | {prev}"
-        )
-
-    lines = [
-        f"window: {payload.get('window_start')} -> {payload.get('window_end')}",
-        f"days: {payload.get('days')}",
-        f"total_entries: {payload.get('total_entries')}",
-        f"nightmare_entries: {payload.get('nightmare_entries')}",
-        f"nightmare_ratio: {payload.get('nightmare_ratio')}",
-        f"tension_level: {payload.get('tension_level')}",
-        f"top_tags: {top_tags}",
-        f"top_words: {top_words}",
-        "highlights:",
-        *(highlight_lines if highlight_lines else ["- none"]),
-    ]
-    return "\n".join(lines)
-
-
-def _render_digest_prompt(payload: dict) -> str:
-    """Render weekly digest prompt from mistral_inputs.yaml (with safe fallback)."""
-    inputs = _load_mistral_inputs()
-    digest_cfg = inputs.get("digest", {})
-    template = digest_cfg.get(
-        "weekly_summary_template",
-        _DEFAULT_MISTRAL_INPUTS["digest"]["weekly_summary_template"],
-    )
-    compact_payload = _compact_digest_for_prompt(payload)
-    digest_json = json.dumps(compact_payload, ensure_ascii=False, indent=2)
-    prompt_brief = _digest_brief_for_prompt(payload)
-    profile = _user_profile_for_prompt()
-    addressing = _user_addressing_instruction()
-    if profile and "{user_profile}" not in template:
-        template = (
-            f"{template}\n\n"
-            "Contexte utilisateur (a prendre en compte dans le digest):\n"
-            "{user_profile}"
-        )
-    if addressing and "{user_addressing}" not in template:
-        template = f"{template}\n\n" "Consigne d'adresse:\n" "{user_addressing}"
-    try:
-        return template.format(
-            days=payload.get("days"),
-            digest_json=digest_json,
-            compact_brief=prompt_brief,
-            weeks_ago=payload.get("weeks_ago"),
-            window_start=payload.get("window_start"),
-            window_end=payload.get("window_end"),
-            user_profile=profile,
-            user_addressing=addressing,
-        )
-    except Exception as e:
-        log.warning(f"Invalid digest prompt template; using default. Error: {e}")
-        fallback = _DEFAULT_MISTRAL_INPUTS["digest"]["weekly_summary_template"]
-        if profile and "{user_profile}" not in fallback:
-            fallback = f"{fallback}\n\n" "Contexte utilisateur:\n" "{user_profile}"
-        if addressing and "{user_addressing}" not in fallback:
-            fallback = f"{fallback}\n\n" "Consigne d'adresse:\n" "{user_addressing}"
-        return fallback.format(
-            days=payload.get("days"),
-            digest_json=digest_json,
-            user_profile=profile,
-            user_addressing=addressing,
-        )
-
-
 @app.post("/digest/weekly/summary")
 async def weekly_digest_summary(request: Request, x_api_key: str = Header(None)):
     """Start background generation for a 4-5 sentence weekly digest summary."""
@@ -3030,7 +2176,14 @@ async def weekly_digest_summary(request: Request, x_api_key: str = Header(None))
                     )
                 return
 
-            prompt = _render_digest_prompt(payload)
+            prompt = _render_digest_prompt(
+                payload,
+                _load_mistral_inputs(),
+                _DEFAULT_MISTRAL_INPUTS,
+                profile=_user_profile_for_prompt(),
+                addressing=_user_addressing_instruction(),
+                logger=log,
+            )
 
             ollama_cfg = cfg.get("ollama", {})
             host = ollama_cfg.get("host", "http://127.0.0.1:11434")
@@ -3276,54 +2429,9 @@ def search_entries(q: str, x_api_key: str = Header(None)):
     _verify_api_key(x_api_key)
     config = _load_config()
     entries_dir = Path(config["storage"]["entries_dir"])
-    results = []
-
-    if not q or len(q.strip()) < 2:
-        return JSONResponse([])
-
-    query = q.strip().lower()
-
-    if entries_dir.exists():
-        for entry in sorted(entries_dir.iterdir(), reverse=True):
-            if not entry.is_dir():
-                continue
-            meta_file = entry / "meta.json"
-            if not meta_file.exists():
-                continue
-
-            # Search across all transcript versions
-            transcript = ""
-            for fname in [
-                "transcript_user.txt",
-                "transcript_corrected.txt",
-                "transcript_raw.txt",
-            ]:
-                f = entry / fname
-                if f.exists():
-                    transcript = f.read_text()
-                    break
-
-            if query in transcript.lower():
-                with open(meta_file) as f:
-                    meta = json.load(f)
-
-                _apply_dream_date_fallback(meta)
-
-                # Find the matching excerpt
-                idx = transcript.lower().find(query)
-                start = max(0, idx - 60)
-                end = min(len(transcript), idx + len(query) + 60)
-                excerpt = (
-                    ("…" if start > 0 else "")
-                    + transcript[start:end]
-                    + ("…" if end < len(transcript) else "")
-                )
-
-                meta["search_excerpt"] = excerpt
-                meta["search_match_pos"] = idx
-                results.append(meta)
-
-    return JSONResponse(results)
+    return JSONResponse(
+        _search_entries(entries_dir, q, normalize_meta=_apply_dream_date_fallback)
+    )
 
 
 @app.get("/vocabulary")

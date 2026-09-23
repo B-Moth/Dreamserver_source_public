@@ -1,6 +1,7 @@
+-r requirements.txt
+
 black
 ruff
 isort
 pre-commit
 pytest
-spacy

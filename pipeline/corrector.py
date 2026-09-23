@@ -7,7 +7,6 @@ corrector.py — LLM correction pipeline for Sandman
 - Updates meta.json with correction status
 """
 
-import json
 import logging
 import threading
 import queue
@@ -16,6 +15,9 @@ from pathlib import Path
 
 import requests
 import yaml
+
+from api.storage import read_meta as _read_meta
+from api.storage import update_meta as _update_meta
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 log = logging.getLogger(__name__)
@@ -222,25 +224,6 @@ def _clean_ollama_output(text: str) -> str:
 
     result = " ".join(s.strip() for s in text_lines if s.strip())
     return result.strip()
-
-
-# ── meta.json helpers ──────────────────────────────────────────────────────────
-
-
-def _read_meta(entry_path: Path):
-    meta_file = entry_path / "meta.json"
-    if not meta_file.exists():
-        return None
-    with open(meta_file) as f:
-        return json.load(f)
-
-
-def _update_meta(entry_path: Path, updates: dict):
-    meta_file = entry_path / "meta.json"
-    meta = _read_meta(entry_path) or {}
-    meta.update(updates)
-    with open(meta_file, "w") as f:
-        json.dump(meta, f, indent=2)
 
 
 # ── Standalone test ────────────────────────────────────────────────────────────

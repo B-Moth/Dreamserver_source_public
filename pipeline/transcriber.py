@@ -8,7 +8,6 @@ transcriber.py — Whisper transcription pipeline for Sandman
 - Updates meta.json with results and confidence scores
 """
 
-import json
 import logging
 import math
 import os
@@ -19,6 +18,9 @@ from datetime import datetime
 from pathlib import Path
 
 import yaml
+
+from api.storage import read_meta as _read_meta
+from api.storage import update_meta as _update_meta
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 log = logging.getLogger(__name__)
@@ -313,25 +315,6 @@ def _split_audio(audio_file: Path, output_dir: Path, chunk_seconds: int):
     ]
     subprocess.run(cmd, check=True)
     return sorted(output_dir.glob("chunk_*.wav"))
-
-
-# ── meta.json helpers ──────────────────────────────────────────────────────────
-
-
-def _read_meta(entry_path: Path):
-    meta_file = entry_path / "meta.json"
-    if not meta_file.exists():
-        return None
-    with open(meta_file) as f:
-        return json.load(f)
-
-
-def _update_meta(entry_path: Path, updates: dict):
-    meta_file = entry_path / "meta.json"
-    meta = _read_meta(entry_path) or {}
-    meta.update(updates)
-    with open(meta_file, "w") as f:
-        json.dump(meta, f, indent=2)
 
 
 # ── Standalone test ────────────────────────────────────────────────────────────

@@ -1,0 +1,8 @@
+# Dreamserver runtime dependencies
+fastapi
+faster-whisper
+pywebpush
+python-multipart
+pyyaml
+requests
+uvicorn[standard]
