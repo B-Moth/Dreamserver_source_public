@@ -38,7 +38,7 @@ The source checkout is the development and review base. The current application 
 	storage/
 ```
 
-Copy or install the repository into that location for the current path conventions to work. The configured entry storage defaults to `/home/sandman/dreamserver/storage/entries`; change it in `config.yaml` for another server account.
+Copy or install the repository into that location for the current path conventions to work. The checked-in `config.yaml` is a public example template; replace its `/srv/dreamserver` paths and placeholder credentials with values for the target server.
 
 ## Server installation
 
@@ -52,7 +52,7 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-Copy and edit the repository configuration before starting the service:
+Copy and edit the repository configuration before starting the service. Do not commit the customized deployment configuration or private VAPID key:
 
 - `config.yaml` controls the server, storage, Whisper, Ollama, digest, correction, maintenance, and push settings.
 - `config/mistral_inputs.yaml` contains editable interpretation, Dream Map, and digest prompts.
@@ -67,7 +67,9 @@ uvicorn api.server:app --host 0.0.0.0 --port 8765
 
 The health endpoint is available at `GET /health`. The PWA is served at `/app` when a production build exists at `pwa/dist`.
 
-The checked-in configuration uses the development API key `dream`. In a real deployment, set a private API key and place the service behind HTTPS. The PWA currently connects to `https://<server-host>:8765`, so TLS or a compatible reverse proxy is required for browser recording and push features.
+The checked-in configuration uses placeholders rather than working credentials. Set a private API key and place the service behind HTTPS. The PWA currently connects to `https://<server-host>:8765`, so TLS or a compatible reverse proxy is required for browser recording and push features.
+
+The PWA reads the API key from browser `localStorage` under `api_key`; configure that value to match the server before using a deployment with authentication enabled.
 
 ## Using the PWA
 

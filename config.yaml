@@ -1,7 +1,7 @@
 server:
   host: 0.0.0.0
   port: 8765
-  api_key: "dream"
+  api_key: "change-me-before-deploying"
 
 pwa:
   base_path: "/app"
@@ -47,14 +47,14 @@ interpretation:
   allow_local_fallback: false
 
 storage:
-  entries_dir: /home/sandman/dreamserver/storage/entries
+  entries_dir: /srv/dreamserver/storage/entries
 
-vocabulary_file: /home/sandman/dreamserver/vocabulary.txt
+vocabulary_file: /srv/dreamserver/vocabulary.txt
 
 push:
-  vapid_public_key: "BBSnDFGD_3HIUTTTS_5pw-qg_Dp1XMqNLqE0UkDjRo0hebk0i_WQSwC2bZBwwCR5B8tLr4dganmCnfZNr3cM5Vo="
-  vapid_private_key: "/home/sandman/dreamserver/vapid_private.pem"
-  vapid_email: "lucaspvberne@gmail.com"
+  vapid_public_key: "replace-with-your-vapid-public-key"
+  vapid_private_key: "/srv/dreamserver/vapid_private.pem"
+  vapid_email: "admin@example.com"
 
 remote_access:
   enabled: false

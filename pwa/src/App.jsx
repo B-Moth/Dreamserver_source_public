@@ -197,7 +197,7 @@ const INTERPRETERS = {
 }
 
 const API_BASE = `https://${window.location.hostname}:8765`
-const DEFAULT_API_KEY = "dream"
+const DEFAULT_API_KEY = ""
 
 function getApiKey() {
   const raw = (localStorage.getItem("api_key") || "").trim()

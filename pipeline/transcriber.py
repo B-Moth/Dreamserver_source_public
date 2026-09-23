@@ -44,7 +44,7 @@ class Transcriber:
     Usage:
         t = Transcriber(on_complete=my_callback)
         t.start()
-        t.enqueue(Path("/home/sandman/dreamserver/storage/entries/2024-03-01_06h12"))
+        t.enqueue(Path("/srv/dreamserver/storage/entries/2024-03-01_06h12"))
         t.resume_pending()  # call once at startup
     """
 
